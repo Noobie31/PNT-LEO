@@ -1,100 +1,99 @@
-import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sgp4.api import Satrec, jday
+from datetime import datetime, timedelta
 
-# --- Constants ---
-mu = 398600.4418  # km^3/s^2
-Re = 6378.137  # km
+# -------------------------------------------------------
+# 1️⃣ Generate Fake Public TLE
+# -------------------------------------------------------
+tle_name = "FAKE-STARLINK-1234"
+line1 = "1 99999U 23001A   25288.45729167  .00000000  00000-0  00000-0 0  9994"
+line2 = "2 99999  53.0000 150.0000 0001200  90.0000 270.0000 15.05420000    15"
 
-# --- Orbit parameters (public TLE made-up) ---
-alt_km = 550.0
-a = Re + alt_km
-n = math.sqrt(mu / a**3)  # rad/s
+sat = Satrec.twoline2rv(line1, line2)
 
-incl_deg = 53.0
-raan_deg = 120.0
-argp_deg = 0.0
+# -------------------------------------------------------
+# 2️⃣ Simulate SDR Observations (with drift)
+# -------------------------------------------------------
+ground_lat, ground_lon = 28.6139, 77.2090   # Example: New Delhi
+num_points = 60
+start_time = datetime(2025, 10, 15, 12, 0, 0)
 
-# 5 satellites along-track
-num_sats = 5
-mean_anomaly_offsets_deg = [i*2 for i in range(num_sats)]  # small spacing
+timestamps = [start_time + timedelta(seconds=i*60) for i in range(num_points)]
 
-# Epochs (seconds)
-epochs = [0, 60, 120, 180, 240, 300]
+obs_positions = []
+pred_positions = []
 
-def rot_x(vec, ang_rad):
-    x, y, z = vec
-    ca = math.cos(ang_rad); sa = math.sin(ang_rad)
-    return (x, ca*y - sa*z, sa*y + ca*z)
+for t in timestamps:
+    jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
+    e, r, v = sat.sgp4(jd, fr)
+    if e == 0:
+        pred_positions.append(r)
+        # simulate SDR observation with drift
+        noise = np.random.normal(0, 5, size=3)  # 5 km noise
+        obs_positions.append(r + noise)
+    else:
+        pred_positions.append([np.nan, np.nan, np.nan])
+        obs_positions.append([np.nan, np.nan, np.nan])
 
-def rot_z(vec, ang_rad):
-    x, y, z = vec
-    ca = math.cos(ang_rad); sa = math.sin(ang_rad)
-    return (ca*x - sa*y, sa*x + ca*y, z)
+pred_positions = np.array(pred_positions)
+obs_positions = np.array(obs_positions)
 
-def orbital_to_eci(a, incl_rad, raan_rad, argp_rad, M_rad):
-    nu = M_rad
-    r_pf = (a*math.cos(nu), a*math.sin(nu), 0.0)
-    r1 = rot_z(r_pf, argp_rad)
-    r2 = rot_x(r1, incl_rad)
-    r3 = rot_z(r2, raan_rad)
-    return r3
+# -------------------------------------------------------
+# 3️⃣ Compute deviation & RMS
+# -------------------------------------------------------
+diffs = obs_positions - pred_positions
+rms_error = np.nanmean(np.linalg.norm(diffs, axis=1))
+print(f"[INFO] RMS position error between TLE prediction and SDR observation: {rms_error:.2f} km")
 
-# --- Generate public TLE positions ---
-public_tle = []
-public_positions = []
-for i in range(num_sats):
-    M0 = math.radians(mean_anomaly_offsets_deg[i])
-    mean_motion_rpd = n*86400/(2*math.pi)
-    public_tle.append({
-        "sat_id": f"SAT{i+1}",
-        "a_km": a,
-        "incl_deg": incl_deg,
-        "raan_deg": raan_deg,
-        "argp_deg": argp_deg,
-        "mean_anomaly_deg": mean_anomaly_offsets_deg[i],
-        "mean_motion_rev_per_day": mean_motion_rpd
-    })
-    positions = []
-    for t in epochs:
-        M_t = M0 + n*t
-        r = orbital_to_eci(a, math.radians(incl_deg), math.radians(raan_deg), math.radians(argp_deg), M_t)
-        positions.append(r)
-    public_positions.append(positions)
+# -------------------------------------------------------
+# 4️⃣ Simple Orbit Correction Logic
+# -------------------------------------------------------
+# Here we estimate a small mean motion correction proportional to observed drift
+# (In real implementation, this would be a least-squares orbit determination)
+drift_factor = np.clip(rms_error / 1000, 0, 0.01)
+original_mean_motion = 15.05420000
+corrected_mean_motion = original_mean_motion * (1 + drift_factor / 10)
 
-# --- Simulate drifted satellite positions (SAT1) ---
-drift_rpd = 0.0005  # rev/day drift
-delta_n = drift_rpd*2*math.pi/86400
-drift_positions = []
-for t in epochs:
-    M0 = math.radians(mean_anomaly_offsets_deg[0])
-    M_t = M0 + (n + delta_n)*t
-    r = orbital_to_eci(a, math.radians(incl_deg), math.radians(raan_deg), math.radians(argp_deg), M_t)
-    drift_positions.append(r)
+line2_new = line2[:52] + f"{corrected_mean_motion:11.8f}" + line2[63:]
 
-# --- Engine: estimate corrected mean motion from drift positions ---
-# Use first and last position to estimate mean motion (simplified)
-def eci_to_angle(r):
-    x, y, z = r
-    return math.atan2(y, x)
+# Generate new calibrated TLE
+cal_name = tle_name + "_CAL"
+cal_line1 = line1
+cal_line2 = line2_new
 
-angle0 = eci_to_angle(drift_positions[0])
-angleN = eci_to_angle(drift_positions[-1])
-# unwrap
-while angleN - angle0 < 0:
-    angleN += 2*math.pi
-n_est = (angleN - angle0) / (epochs[-1] - epochs[0])
-mean_motion_rpd_est = n_est*86400/(2*math.pi)
+print("\n[INFO] New Calibrated TLE:")
+print(cal_name)
+print(cal_line1)
+print(cal_line2)
 
-corrected_tle = public_tle[0].copy()
-corrected_tle["mean_motion_rev_per_day"] = round(mean_motion_rpd_est, 9)
+# -------------------------------------------------------
+# 5️⃣ Visualize Orbits
+# -------------------------------------------------------
+fig = plt.figure(figsize=(8, 6))
+ax = fig.add_subplot(111, projection='3d')
 
-# --- Terminal Output ---
-print("=== Public TLE (simulated) ===")
-for sat in public_tle:
-    print(sat)
+ax.plot(pred_positions[:,0], pred_positions[:,1], pred_positions[:,2], label="Predicted Orbit (TLE)", color='blue')
+ax.plot(obs_positions[:,0], obs_positions[:,1], obs_positions[:,2], label="Observed SDR Data", color='red', linestyle='dotted')
 
-print("\n=== Drifted SAT1 Positions (ECI km) ===")
-for t,r in zip(epochs, drift_positions):
-    print(f"t={t}s: {r}")
+# Simulate recalibrated orbit with corrected mean motion
+sat_cal = Satrec.twoline2rv(cal_line1, cal_line2)
+cal_positions = []
+for t in timestamps:
+    jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
+    e, r, v = sat_cal.sgp4(jd, fr)
+    if e == 0:
+        cal_positions.append(r)
+    else:
+        cal_positions.append([np.nan, np.nan, np.nan])
+cal_positions = np.array(cal_positions)
 
-print("\n=== Corrected TLE (SAT1) ===")
-print(corrected_tle)
+ax.plot(cal_positions[:,0], cal_positions[:,1], cal_positions[:,2], label="Calibrated Orbit", color='green', linestyle='--')
+
+ax.set_xlabel('X (km)')
+ax.set_ylabel('Y (km)')
+ax.set_zlabel('Z (km)')
+ax.legend()
+ax.set_title("LEO Orbit Calibration Engine Simulation")
+plt.show()
